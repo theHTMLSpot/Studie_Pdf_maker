@@ -31,3 +31,4 @@ venv.bak/
 uploads/
 *.pdf
 .DS_Store
+backend/models/*.gguf
