@@ -1,6 +1,5 @@
 "use client";
 
-import { data } from "autoprefixer";
 import { useRef, useState } from "react";
 import useSWRMutation from "swr/mutation";
 
@@ -117,7 +116,7 @@ function StudyPlanDisplay({ plan }: { plan: StudyPlan }) {
                 ? `📝 Notes (${plan.notes.length})`
                 : tab === "concepts"
                   ? `🎯 Key Concepts (${plan.key_concepts.length})`
-                  : `💡 Study Tips`}
+                  : `💡 Study Tips (${plan.study_recommendations.length})`}
             </button>
           ))}
         </div>
@@ -132,23 +131,20 @@ function StudyPlanDisplay({ plan }: { plan: StudyPlan }) {
                 {note}
               </div>
             ))}
-          {activeTab === "concepts" && (
-            <div className="grid grid-cols-2 gap-3">
-              {plan.key_concepts.map((c, i) => (
-                <div
-                  key={i}
-                  className="bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-3"
-                >
-                  {c}
-                </div>
-              ))}
-            </div>
-          )}
+          {activeTab === "concepts" &&
+            plan.key_concepts.map((concept, i) => (
+              <div
+                key={i}
+                className="bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-3 mb-2"
+              >
+                {concept}
+              </div>
+            ))}
           {activeTab === "recommendations" &&
             plan.study_recommendations.map((r, i) => (
               <div
                 key={i}
-                className="flex items-start space-x-3 p-4 bg-green-50 border border-green-200 rounded-lg m-2"
+                className="flex items-start space-x-3 p-4 bg-green-50 border border-green-200 rounded-lg mb-2"
               >
                 <span className="text-xl">✓</span>
                 <p>{r}</p>
@@ -167,28 +163,45 @@ function StudyPlanDisplay({ plan }: { plan: StudyPlan }) {
   );
 }
 
-// -------------------------
-// MAIN PAGE
-// -------------------------
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const { trigger, data, isMutating, error } = useSWRMutation(
-    "/api/upload-pdf",
+  const [error, setError] = useState<string | null>(null);
+  const {
+    trigger,
+    data,
+    isMutating,
+    error: mutationError,
+  } = useSWRMutation(
+    "http://localhost:8000/upload-pdf",
     async (_url, { arg }: { arg: File }) => {
+      console.log("Starting upload for file:", arg.name);
       const form = new FormData();
       form.append("file", arg);
-      const res = await fetch("http://localhost:8000/upload-pdf", {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) throw new Error("Upload failed");
-      return res.json();
+      try {
+        const res = await fetch(_url, { method: "POST", body: form });
+        console.log("Response status:", res.status);
+        if (!res.ok) {
+          const errorText = await res.text();
+          console.error("API error:", errorText);
+          throw new Error(`Upload failed: ${res.status} ${errorText}`);
+        }
+        const jsonData = await res.json();
+        console.log("Received data:", jsonData);
+        return jsonData as StudyPlan;
+      } catch (err) {
+        console.error("Upload error:", err);
+        throw err;
+      }
     },
   );
 
   const handleUpload = (f: File) => {
     setFile(f);
-    trigger(f);
+    setError(null);
+    trigger(f).catch((err) => {
+      console.error("Trigger error:", err);
+      setError(err.message || "Upload failed");
+    });
   };
 
   return (
@@ -203,12 +216,32 @@ export default function Home() {
         </div>
 
         <div className="lg:col-span-2">
+          {error && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+              <p className="text-red-700">❌ Error: {error}</p>
+            </div>
+          )}
+          {mutationError && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+              <p className="text-red-700">
+                ❌ Upload Error: {mutationError.message}
+              </p>
+            </div>
+          )}
           {isMutating ? (
-            <p>Processing your PDF...</p>
+            <div className="bg-white rounded-lg shadow p-8 text-center">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
+              <p className="text-lg text-gray-600">Processing your PDF...</p>
+              <p className="text-sm text-gray-500 mt-2">
+                This may take a minute
+              </p>
+            </div>
           ) : data ? (
             <StudyPlanDisplay plan={data} />
           ) : (
-            <p>Upload a PDF to get started</p>
+            <div className="bg-white rounded-lg shadow p-8 text-center text-gray-500">
+              <p className="text-lg">Upload a PDF to get started</p>
+            </div>
           )}
         </div>
       </div>

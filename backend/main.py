@@ -3,261 +3,266 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel
-import fitz  # PyMuPDF
+from typing import List, Dict
+import fitz
 import uuid
 import httpx
-import asyncio
 import aiofiles
+import json
+import re
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
 # -------------------------
 # CONFIG
 # -------------------------
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "llama3"
+REQUEST_TIMEOUT = 10000
 
 # -------------------------
-# APP SETUP
+# APP
 # -------------------------
-app = FastAPI(title="LLaMA PDF Study Assistant", version="2.0")
+app = FastAPI(title="LLaMA PDF Study Assistant", version="6.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production frontend
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------
-# MODELS
+# MODEL
 # -------------------------
 class StudyPlan(BaseModel):
     title: str
-    notes: list[str]
-    key_concepts: list[str]
-    study_recommendations: list[str]
+    notes: List[str]
+    key_concepts: List[str]
+    study_recommendations: List[str]
     estimated_study_hours: float
     download_url: str
 
 # -------------------------
-# UTILITIES
+# CLEANING HELPERS
+# -------------------------
+def validate_list(value):
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if isinstance(v, str) and v.strip()]
+    return []
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    clean = []
+    for item in items:
+        key = item.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            clean.append(item.strip())
+    return clean
+
+def split_large_notes(notes: List[str]) -> List[str]:
+    split_notes = []
+    for note in notes:
+        if len(note) > 1500:
+            parts = re.split(r'\n\n|\.\s+', note)
+            split_notes.extend([p.strip() for p in parts if p.strip()])
+        else:
+            split_notes.append(note.strip())
+    return split_notes
+
+def estimate_study_hours(notes: List[str]) -> float:
+    # Simple deterministic heuristic:
+    # ~12 minutes per detailed note
+    hours = len(notes) * 0.2
+    return max(1.0, round(hours, 1))
+
+# -------------------------
+# PDF GENERATION
 # -------------------------
 def create_study_pdf(plan: StudyPlan, output_path: Path):
-    c = canvas.Canvas(str(output_path), pagesize=A4)
-    width, height = A4
+    doc = SimpleDocTemplate(str(output_path), pagesize=A4)
+    elements = []
+    styles = getSampleStyleSheet()
 
-    y = height - 50
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(50, y, plan.title)
+    elements.append(Paragraph(plan.title, styles["Heading1"]))
+    elements.append(Spacer(1, 0.3 * inch))
 
-    # Notes
-    y -= 40
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, "Notes")
-    y -= 20
-    c.setFont("Helvetica", 11)
-    for note in plan.notes:
-        for line in note.splitlines():
-            if y < 50:
-                c.showPage()
-                y = height - 50
-                c.setFont("Helvetica", 11)
-            c.drawString(60, y, f"- {line}")
-            y -= 15
-        y -= 10
+    def add_section(title: str, items: List[str]):
+        if not items:
+            return
+        elements.append(Paragraph(title, styles["Heading2"]))
+        elements.append(Spacer(1, 0.2 * inch))
+        flow = []
+        for item in items:
+            formatted = item.replace("\n", "<br/>")
+            flow.append(ListItem(Paragraph(formatted, styles["Normal"])))
+        elements.append(ListFlowable(flow, bulletType="bullet"))
+        elements.append(Spacer(1, 0.4 * inch))
 
-    # Key Concepts
-    y -= 20
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, "Key Concepts")
-    y -= 20
-    c.setFont("Helvetica", 11)
-    for concept in plan.key_concepts:
-        if y < 50:
-            c.showPage()
-            y = height - 50
-            c.setFont("Helvetica", 11)
-        c.drawString(60, y, f"- {concept}")
-        y -= 15
+    add_section("Notes", plan.notes)
+    add_section("Key Concepts", plan.key_concepts)
+    add_section("Study Recommendations", plan.study_recommendations)
 
-    # Study Recommendations
-    y -= 20
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, "Study Recommendations")
-    y -= 20
-    c.setFont("Helvetica", 11)
-    for rec in plan.study_recommendations:
-        if y < 50:
-            c.showPage()
-            y = height - 50
-            c.setFont("Helvetica", 11)
-        c.drawString(60, y, f"- {rec}")
-        y -= 15
+    doc.build(elements)
 
-    c.save()
-
+# -------------------------
+# PDF TEXT EXTRACTION
+# -------------------------
 def extract_pdf_text(file_path: Path) -> str:
     doc = fitz.open(file_path)
     text = "\n".join(page.get_text("text") for page in doc)
     doc.close()
     return text.strip()
 
-def chunk_text(text: str, max_chars: int = 3000) -> list[str]:
-    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+# -------------------------
+# SMART CHUNKING
+# -------------------------
+def smart_chunk_text(text: str, max_chars: int = 2500) -> List[str]:
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current = ""
+    for p in paragraphs:
+        if len(current) + len(p) < max_chars:
+            current += p + "\n\n"
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = p + "\n\n"
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
 
 # -------------------------
-# LLaMA INTERACTION
+# SAFE JSON EXTRACTION
 # -------------------------
-async def process_chunk(client: httpx.AsyncClient, chunk: str) -> dict:
+def extract_json(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find('{')
+        while start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+            start = text.find('{', start + 1)
+    print("FAILED TO PARSE LLM JSON")
+    return {}
+
+# -------------------------
+# LLM CALL (CHUNK LEVEL ONLY)
+# -------------------------
+async def call_llm(prompt: str):
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 700  # reduced from 4096
+        }
+    }
+
+    try:
+        timeout = httpx.Timeout(
+            connect=20.0,
+            read=180.0,   # hard read cap per chunk
+            write=20.0,
+            pool=20.0
+        )
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(OLLAMA_URL, json=payload)
+            resp.raise_for_status()
+
+            raw = resp.json().get("response", "").strip()
+            return extract_json(raw)
+
+    except httpx.ReadTimeout:
+        print("⚠️ Chunk timed out — skipping")
+        return {}
+
+    except Exception as e:
+        print("⚠️ LLM error:", e)
+        return {}
+
+async def summarize_chunk(chunk: str) -> Dict[str, List[str]]:
     prompt = f"""
-You are a school professor helping students create study guides from textbook content.
-
-Read the following text and do the following:
-1. Identify the topic and subject area.
-2. Create concise study notes covering one core concept each.
-- Each note must be at least 3 lines and at most 5 lines.
-- Produce up to 10 notes per chunk.
-- Across the entire text, produce at most 15 notes.
-- Use only examples that appear in the text if needed.
-3. Extract the main key concepts (names or terms).
-4. Give study recommendations.
-
-HARD RULES:
-- ALL output must be in the SAME LANGUAGE as the input text. 
-- DO NOT use English words if the input text is not English. 
-- DO NOT use headings, titles, or labels.
-- Each note is a factual statement, not a question or task.
-- Do not reference exercises, assignments, questions, images, or sources outside the text.
-- Always produce notes, even if the text is short.
-- These rules are for notes, concepts, and recommendations.
-
-OUTPUT FORMAT (STRICT):
-Estimated Study Hours: X.Y
----
-Notes:
-- note title
-note content line 1
-note content line 2
-note content line 3
---end-note--
-- next note title
-note content
---end-note--
----
-Key Concepts:
-- concept 1
-- concept 2
----
-Study Recommendations:
-- recommendation 1
-- recommendation 2
+Return ONLY valid JSON with keys: notes, key_concepts, study_recommendations.
+- "notes": list of detailed study notes.
+- "key_concepts": list of key terms.
+- "study_recommendations": optional study recommendations.
 
 TEXT:
 {chunk}
 """
-
-    payload = {"model": "llama3", "prompt": prompt, "stream": False}
-
-    try:
-        resp = await client.post(OLLAMA_URL, json=payload)
-        resp.raise_for_status()
-        raw = resp.json().get("response", "")
-        print("Ollama raw response:", raw[:500])  # debug
-    except (httpx.RequestError, httpx.HTTPStatusError) as e:
-        print(f"Ollama error: {e}")
-        return {"notes": [], "concepts": [], "recommendations": [], "estimated_hours": 1.0}
-
-    notes, concepts, recommendations = [], [], []
-    estimated_hours = 1.0  # default
-
-    # Extract Estimated Study Hours first
-    import re
-    m = re.search(r"Estimated Study Hours:\s*([0-9]+(?:\.[0-9]+)?)", raw)
-    if m:
-        estimated_hours = float(m.group(1))
-        raw = raw.replace(m.group(0), "")
-
-    # Split remaining content into sections
-    sections = [s.strip() for s in raw.split("---") if s.strip()]
-    for section in sections:
-        lines = [l.strip() for l in section.splitlines() if l.strip()]
-        if not lines:
-            continue
-        header = lines[0].lower()
-        # Notes
-        if "notes" in header:
-            current_note = []
-            for line in lines[1:]:
-                if line == "--end-note--":
-                    if current_note:
-                        # enforce 3-5 lines per note
-                        note_lines = current_note[:5]
-                        while len(note_lines) < 3:
-                            note_lines.append("")  # pad short notes
-                        notes.append("\n".join(note_lines))
-                        current_note = []
-                else:
-                    current_note.append(line)
-            if current_note:
-                note_lines = current_note[:5]
-                while len(note_lines) < 3:
-                    note_lines.append("")
-                notes.append("\n".join(note_lines))
-        # Key Concepts
-        elif "key concepts" in header:
-            for line in lines[1:]:
-                if line.startswith("- "):
-                    concepts.append(line[2:].strip())
-        # Study Recommendations
-        elif "study recommendations" in header:
-            for line in lines[1:]:
-                if line.startswith("- "):
-                    recommendations.append(line[2:].strip())
+    data = await call_llm(prompt)
 
     return {
-        "notes": notes,
-        "concepts": concepts,
-        "recommendations": recommendations,
-        "estimated_hours": estimated_hours,
+        "notes": validate_list(data.get("notes")),
+        "key_concepts": validate_list(data.get("key_concepts")),
+        "study_recommendations": validate_list(data.get("study_recommendations"))
     }
 
-async def generate_study_plan(text: str, original_filename: str) -> StudyPlan:
-    chunks = chunk_text(text)
-    notes, key_concepts, recommendations = [], [], []
+# -------------------------
+# MAIN PIPELINE
+# -------------------------
+async def generate_study_plan(text: str, original_filename: str):
+    chunks = smart_chunk_text(text)
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        tasks = [process_chunk(client, c) for c in chunks[:10]]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            notes.extend(r["notes"])
-            key_concepts.extend(r["concepts"])
-            recommendations.extend(r["recommendations"])
+    all_notes = []
+    all_concepts = []
+    all_recommendations = []
 
-    # enforce max 15 notes total
-    notes = notes[:15]
+    for chunk in chunks:
+        data = await summarize_chunk(chunk)
+        all_notes.extend(data["notes"])
+        all_concepts.extend(data["key_concepts"])
+        all_recommendations.extend(data["study_recommendations"])
 
-    estimated_hours = max(1.0, len(chunks) * 1.5)
+    print(f"TOTAL NOTES: {len(all_notes)}")
+    print(f"TOTAL CONCEPTS: {len(all_concepts)}")
+    print(f"TOTAL RECOMMENDATIONS: {len(all_recommendations)}")
+
+    # Deterministic cleaning
+    clean_notes = split_large_notes(dedupe_preserve_order(all_notes))
+    clean_concepts = dedupe_preserve_order(all_concepts)
+    clean_recommendations = dedupe_preserve_order(all_recommendations)
+
+    estimated_hours = estimate_study_hours(clean_notes)
 
     output_pdf = DOWNLOAD_DIR / f"study_{original_filename}"
 
     plan = StudyPlan(
         title=f"Study Guide – {original_filename}",
-        notes=notes,
-        key_concepts=list(dict.fromkeys(key_concepts))[:20],
-        study_recommendations=recommendations[:10],
+        notes=clean_notes,
+        key_concepts=clean_concepts,
+        study_recommendations=clean_recommendations,
         estimated_study_hours=estimated_hours,
         download_url=f"http://localhost:8000/download/{output_pdf.name}",
     )
 
     create_study_pdf(plan, output_pdf)
+
     return plan
 
 # -------------------------
@@ -266,7 +271,7 @@ async def generate_study_plan(text: str, original_filename: str) -> StudyPlan:
 @app.post("/upload-pdf", response_model=StudyPlan)
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
+        raise HTTPException(400, "Only PDF files supported")
 
     safe_filename = f"{uuid.uuid4()}_{file.filename}"
     file_path = UPLOAD_DIR / safe_filename
@@ -277,7 +282,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     text = extract_pdf_text(file_path)
     if not text:
-        raise HTTPException(400, "No extractable text found in PDF")
+        raise HTTPException(400, "No extractable text found")
 
     return await generate_study_plan(text, file.filename)
 
@@ -287,14 +292,14 @@ async def download_file(filename: str):
         raise HTTPException(400, "Invalid filename")
 
     file_path = DOWNLOAD_DIR / filename
-    if not file_path.exists() or not file_path.is_file():
+    if not file_path.exists():
         raise HTTPException(404, "File not found")
 
     return FileResponse(file_path, media_type="application/pdf", filename=filename)
 
 # -------------------------
-# DEV ENTRYPOINT
+# RUN
 # -------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
